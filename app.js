@@ -522,6 +522,13 @@ const PROP_ASSET_PATHS = {
   cartridges: "assets/props/cartridges.png"
 };
 
+const MAP_MIN_SIZE = 6;
+const MAP_MAX_SIZE = 60;
+const RIVER_NETWORK_SOURCE_LIMIT = 32;
+const ROAD_NETWORK_LIMIT = 180;
+const ROAD_BRANCH_LIMIT = 420;
+const RAIL_NETWORK_LIMIT = 90;
+
 const propAssets = {};
 
 const state = {
@@ -544,6 +551,8 @@ const state = {
     moved: false,
     suppressClick: false
   },
+  renderQueued: false,
+  layoutCache: null,
   mapMode: "atmospheric",
   lang: INITIAL_LANGUAGE === "en" ? "en" : INITIAL_LANGUAGE === "ru" ? "ru" : localStorage.getItem("deadLandLanguage") === "en" ? "en" : "ru",
   statusKey: "ready"
@@ -702,8 +711,8 @@ function generate() {
 
 function readSettings() {
   const seed = (els.seed.value || freshSeed()).trim();
-  const width = clamp(parseInt(els.width.value, 10) || 16, 6, 28);
-  const height = clamp(parseInt(els.height.value, 10) || 12, 6, 22);
+  const width = clamp(parseInt(els.width.value, 10) || 16, MAP_MIN_SIZE, MAP_MAX_SIZE);
+  const height = clamp(parseInt(els.height.value, 10) || 12, MAP_MIN_SIZE, MAP_MAX_SIZE);
   els.seed.value = seed;
   els.width.value = String(width);
   els.height.value = String(height);
@@ -799,9 +808,12 @@ function createMap(width, height, seed) {
   const byKey = new Map();
   for (let r = 0; r < height; r += 1) {
     for (let q = 0; q < width; q += 1) {
+      const raw = offsetToPixel(q, r, 1);
       const cell = {
         q,
         r,
+        rawX: raw.x,
+        rawY: raw.y,
         key: coordKey(q, r),
         label: cellLabel(q, r),
         generated: false,
@@ -842,6 +854,29 @@ function fillRegion(map, rng) {
   let generated = 0;
   let order = 1;
   const total = map.width * map.height;
+  const frontier = [];
+  const frontierKeys = new Set();
+
+  function addFrontier(cell) {
+    if (!cell || !cell.generated || frontierKeys.has(cell.key)) return;
+    if (!hasUngeneratedNeighbor(map, cell)) return;
+    frontier.push(cell);
+    frontierKeys.add(cell.key);
+  }
+
+  function takeFrontier() {
+    while (frontier.length > 0) {
+      const index = Math.floor(rng() * frontier.length);
+      const candidate = frontier[index];
+      if (candidate.generated && hasUngeneratedNeighbor(map, candidate)) {
+        return candidate;
+      }
+      frontierKeys.delete(candidate.key);
+      frontier[index] = frontier[frontier.length - 1];
+      frontier.pop();
+    }
+    return null;
+  }
 
   while (generated < total) {
     if (!current.generated) {
@@ -850,6 +885,10 @@ function fillRegion(map, rng) {
       current.order = order;
       order += 1;
       generated += 1;
+      addFrontier(current);
+      for (const near of neighbors(map, current)) {
+        addFrontier(near);
+      }
     }
 
     const next = chooseNextHex(map, current, rng);
@@ -858,11 +897,9 @@ function fillRegion(map, rng) {
       continue;
     }
 
-    const frontier = map.cells.filter((cell) => {
-      return cell.generated && neighbors(map, cell).some((near) => !near.generated);
-    });
-    if (frontier.length > 0) {
-      current = choice(frontier, rng);
+    const frontierCell = takeFrontier();
+    if (frontierCell) {
+      current = frontierCell;
       continue;
     }
 
@@ -871,6 +908,10 @@ function fillRegion(map, rng) {
       current = unfilled;
     }
   }
+}
+
+function hasUngeneratedNeighbor(map, cell) {
+  return neighbors(map, cell).some((near) => !near.generated);
 }
 
 function chooseNextHex(map, cell, rng) {
@@ -1019,7 +1060,36 @@ function peopleInBlock(total) {
 
 function buildRivers(map, rng) {
   map.riverEdges.clear();
-  const sources = map.cells.filter((cell) => cell.originalRiver);
+  const rolledSources = map.cells.filter((cell) => cell.originalRiver);
+  if (rolledSources.length === 0) {
+    return;
+  }
+
+  for (const cell of rolledSources) {
+    cell.hasRiver = false;
+    cell.riverLake = false;
+  }
+
+  const { sources, extraLakes } = selectRiverSources(map, rolledSources, rng);
+  const sourceKeys = new Set(sources.map((cell) => cell.key));
+  const lakeKeys = new Set(extraLakes.map((cell) => cell.key));
+
+  for (const cell of rolledSources) {
+    if (sourceKeys.has(cell.key)) {
+      cell.originalRiver = true;
+      continue;
+    }
+    if (lakeKeys.has(cell.key)) {
+      cell.originalRiver = true;
+      cell.hasRiver = true;
+      cell.riverLake = true;
+      continue;
+    }
+
+    cell.originalRiver = false;
+    cell.primaryTerrain = cell.terrain;
+  }
+
   if (sources.length === 0) {
     return;
   }
@@ -1027,8 +1097,9 @@ function buildRivers(map, rng) {
   const groups = clusterRiverSources(sources);
   for (const group of groups) {
     if (group.length === 1) {
-      group[0].riverLake = true;
+      const flowDir = Math.floor(rng() * 6);
       group[0].hasRiver = true;
+      extendRiver(map, group[0], flowDir, rng);
       continue;
     }
 
@@ -1043,6 +1114,26 @@ function buildRivers(map, rng) {
     extendRiver(map, low, (flowDir + 3) % 6, rng);
     extendRiver(map, high, flowDir, rng);
   }
+}
+
+function selectRiverSources(map, sources, rng) {
+  const area = map.width * map.height;
+  const limit = area <= 900
+    ? sources.length
+    : Math.min(RIVER_NETWORK_SOURCE_LIMIT, Math.max(12, Math.round(Math.sqrt(area) * 0.45)));
+
+  if (sources.length <= limit) {
+    return { sources, extraLakes: [] };
+  }
+
+  const selected = spreadSample(map, sources, limit, rng);
+  const selectedKeys = new Set(selected.map((cell) => cell.key));
+  const remaining = sources.filter((cell) => !selectedKeys.has(cell.key));
+  const extraLakeLimit = Math.min(remaining.length, Math.max(4, Math.round(Math.sqrt(area) * 0.22)));
+  return {
+    sources: selected,
+    extraLakes: spreadSample(map, remaining, extraLakeLimit, rng)
+  };
 }
 
 function clusterRiverSources(sources) {
@@ -1166,8 +1257,10 @@ function buildRoads(map, rng) {
   }
 
   const cultivated = map.cells.filter((cell) => cell.terrain === "cultivated");
-  connectPoints(map, cultivated, "road", rng);
-  addRoadBranches(map, cultivated, rng);
+  const networkPoints = selectRoadNetworkPoints(map, cultivated, rng);
+  const branchAnchors = spreadSample(map, cultivated, ROAD_BRANCH_LIMIT, rng);
+  connectPoints(map, networkPoints, "road", rng);
+  addRoadBranches(map, branchAnchors, rng);
   markBridges(map);
 }
 
@@ -1198,8 +1291,71 @@ function buildRailways(map, rng) {
   const largeSettlements = map.cells.filter((cell) => {
     return cell.settlement && cell.settlement.blocks >= 4;
   });
-  connectPoints(map, largeSettlements, "rail", rng);
+  connectPoints(map, spreadSample(map, largeSettlements, RAIL_NETWORK_LIMIT, rng), "rail", rng);
   markBridges(map);
+}
+
+function selectRoadNetworkPoints(map, cultivated, rng) {
+  if (cultivated.length <= ROAD_NETWORK_LIMIT) {
+    return cultivated;
+  }
+
+  const important = cultivated.filter((cell) => {
+    return cell.settlement || cell.cultivated === "settlement" || cell.cultivated === "mines";
+  });
+  const selected = [];
+  const selectedKeys = new Set();
+
+  function add(cell) {
+    if (!cell || selectedKeys.has(cell.key)) return;
+    selected.push(cell);
+    selectedKeys.add(cell.key);
+  }
+
+  const importantLimit = Math.min(important.length, Math.floor(ROAD_NETWORK_LIMIT * 0.72));
+  for (const cell of spreadSample(map, important, importantLimit, rng)) {
+    add(cell);
+  }
+
+  const remaining = cultivated.filter((cell) => !selectedKeys.has(cell.key));
+  for (const cell of spreadSample(map, remaining, ROAD_NETWORK_LIMIT - selected.length, rng)) {
+    add(cell);
+  }
+
+  return selected;
+}
+
+function spreadSample(map, points, limit, rng) {
+  if (points.length <= limit) return points.slice();
+  if (limit <= 0) return [];
+
+  const bucketSize = Math.max(2, Math.ceil(Math.sqrt((map.width * map.height) / limit)));
+  const buckets = new Map();
+  for (const cell of points) {
+    const key = `${Math.floor(cell.q / bucketSize)},${Math.floor(cell.r / bucketSize)}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(cell);
+  }
+
+  const bucketList = [...buckets.values()];
+  shuffleInPlace(bucketList, rng);
+  const picked = [];
+
+  while (picked.length < limit && bucketList.length > 0) {
+    let added = false;
+    for (const bucket of bucketList) {
+      if (bucket.length === 0) continue;
+      const index = Math.floor(rng() * bucket.length);
+      picked.push(bucket[index]);
+      bucket[index] = bucket[bucket.length - 1];
+      bucket.pop();
+      added = true;
+      if (picked.length >= limit) break;
+    }
+    if (!added) break;
+  }
+
+  return picked;
 }
 
 function connectPoints(map, points, mode, rng) {
@@ -1339,22 +1495,68 @@ function render() {
   if (!state.map) return;
   resizeCanvas(false);
   const map = state.map;
-  state.layout = applyView(computeLayout(map, els.canvas.width, els.canvas.height));
+  state.layout = applyView(baseLayoutFor(map, els.canvas.width, els.canvas.height));
+  const visibleCells = visibleMapCells(map);
 
   ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
   drawCanvasGround();
-  for (const cell of map.cells) drawHexBase(cell);
-  if (isAtmosphericMode()) drawBattlefieldGrime();
+  for (const cell of visibleCells) drawHexBase(cell);
+  if (isAtmosphericMode() && !isLiteMapRender()) drawBattlefieldGrime();
   drawEdgeSet(map.riverEdges, drawRiverSegment);
-  for (const cell of map.cells.filter((item) => item.riverLake)) drawLake(cell);
+  for (const cell of visibleCells) {
+    if (cell.riverLake) drawLake(cell);
+  }
   drawEdgeSet(map.roadEdges, drawRoadSegment);
   drawEdgeSet(map.railEdges, drawRailSegment);
-  for (const cell of map.cells) drawCellOverlays(cell);
+  for (const cell of visibleCells) drawCellOverlays(cell);
   if (isAtmosphericMode()) drawSmokeLayer();
   if (isAtmosphericMode()) drawAtmosphericFinish();
   if (isAtmosphericMode()) drawTableProps(els.canvas.width, els.canvas.height, "over");
   if (state.selected) drawSelection(state.selected);
   drawEditorPendingSelection();
+}
+
+function baseLayoutFor(map, width, height) {
+  const mode = state.mapMode;
+  const cached = state.layoutCache;
+  if (cached && cached.map === map && cached.width === width && cached.height === height && cached.mode === mode) {
+    return cached.layout;
+  }
+
+  const layout = computeLayout(map, width, height);
+  state.layoutCache = { map, width, height, mode, layout };
+  return layout;
+}
+
+function queueRender() {
+  if (state.renderQueued) return;
+  state.renderQueued = true;
+  const schedule = window.requestAnimationFrame || ((callback) => setTimeout(callback, 16));
+  schedule(() => {
+    state.renderQueued = false;
+    render();
+  });
+}
+
+function visibleMapCells(map) {
+  if (map.cells.length <= 900) return map.cells;
+  const margin = state.layout.size * 2;
+  const minX = -margin;
+  const minY = -margin;
+  const maxX = els.canvas.width + margin;
+  const maxY = els.canvas.height + margin;
+  return map.cells.filter((cell) => {
+    const center = centerOf(cell);
+    return center.x >= minX && center.x <= maxX && center.y >= minY && center.y <= maxY;
+  });
+}
+
+function isLargeMap() {
+  return Boolean(state.map && state.map.cells.length > 1600);
+}
+
+function isLiteMapRender() {
+  return isLargeMap() && state.layout && state.layout.size < 13;
 }
 
 function resizeCanvas(updateRender = true) {
@@ -1371,21 +1573,15 @@ function resizeCanvas(updateRender = true) {
 }
 
 function computeLayout(map, width, height) {
-  const raw = [];
-  for (const cell of map.cells) {
-    const center = offsetToPixel(cell.q, cell.r, 1);
-    raw.push(center);
-  }
-
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  for (const point of raw) {
-    minX = Math.min(minX, point.x - 1);
-    minY = Math.min(minY, point.y - 1);
-    maxX = Math.max(maxX, point.x + 1);
-    maxY = Math.max(maxY, point.y + 1);
+  for (const cell of map.cells) {
+    minX = Math.min(minX, cell.rawX - 1);
+    minY = Math.min(minY, cell.rawY - 1);
+    maxX = Math.max(maxX, cell.rawX + 1);
+    maxY = Math.max(maxY, cell.rawY + 1);
   }
 
   const padding = Math.min(width, height) * (isAtmosphericMode() ? 0.115 : 0.055);
@@ -2286,13 +2482,16 @@ function drawAtmosphericFinish() {
 function drawHexBase(cell) {
   const points = hexPoints(cell);
   const terrain = TERRAIN[cell.terrain];
+  const lite = isLiteMapRender();
   ctx.save();
   pathFromPoints(points);
   ctx.fillStyle = terrainFill(cell, terrain);
   ctx.fill();
-  ctx.clip();
-  drawHexTexture(cell);
-  drawTerrainMark(cell);
+  if (!lite) {
+    ctx.clip();
+    drawHexTexture(cell);
+    drawTerrainMark(cell);
+  }
   ctx.restore();
 
   ctx.save();
@@ -2605,10 +2804,21 @@ function drawLake(cell) {
 
 function drawEdgeSet(set, drawFn) {
   if (!state.map) return;
+  const margin = state.layout.size * 2;
   for (const key of set) {
     const [a, b] = edgeCells(state.map, key);
+    if (!a || !b || !edgeIsVisible(a, b, margin)) continue;
     drawFn(a, b);
   }
+}
+
+function edgeIsVisible(a, b, margin) {
+  const ac = centerOf(a);
+  const bc = centerOf(b);
+  return Math.max(ac.x, bc.x) >= -margin
+    && Math.min(ac.x, bc.x) <= els.canvas.width + margin
+    && Math.max(ac.y, bc.y) >= -margin
+    && Math.min(ac.y, bc.y) <= els.canvas.height + margin;
 }
 
 function drawRiverSegment(a, b) {
@@ -2696,10 +2906,48 @@ function drawRailSegment(a, b) {
 function drawCellOverlays(cell) {
   const center = centerOf(cell);
   const size = state.layout.size;
+  if (isLiteMapRender()) {
+    drawLiteCellOverlays(cell, center, size);
+    return;
+  }
   if (cell.settlement) drawSettlement(cell, center, size);
   if (cell.feature) drawFeature(cell, center, size);
   if (cell.bridge) drawBridge(center, size);
   drawCellLabel(cell, center, size);
+}
+
+function drawLiteCellOverlays(cell, center, size) {
+  if (cell.settlement) {
+    ctx.save();
+    ctx.fillStyle = cell.settlement.abandoned ? "rgba(36, 31, 28, 0.86)" : "rgba(226, 193, 127, 0.88)";
+    ctx.strokeStyle = cell.settlement.abandoned ? "rgba(236, 226, 203, 0.34)" : "rgba(42, 26, 17, 0.88)";
+    ctx.lineWidth = Math.max(1, size * 0.08);
+    ctx.beginPath();
+    ctx.arc(center.x, center.y, Math.max(2.2, size * (cell.settlement.blocks >= 4 ? 0.28 : 0.2)), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (cell.feature) {
+    ctx.save();
+    ctx.fillStyle = "rgba(221, 199, 148, 0.82)";
+    ctx.strokeStyle = "rgba(31, 22, 15, 0.9)";
+    ctx.lineWidth = Math.max(1, size * 0.07);
+    ctx.beginPath();
+    ctx.moveTo(center.x, center.y - size * 0.28);
+    ctx.lineTo(center.x + size * 0.26, center.y);
+    ctx.lineTo(center.x, center.y + size * 0.28);
+    ctx.lineTo(center.x - size * 0.26, center.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (cell.bridge) {
+    drawBridge(center, size);
+  }
 }
 
 function drawSettlement(cell, center, size) {
@@ -3931,11 +4179,19 @@ function onCanvasClick(event) {
 }
 
 function cellAtPoint(point) {
-  const x = point.x;
-  const y = point.y;
-  for (const cell of state.map.cells) {
-    if (pointInPoly({ x, y }, hexPoints(cell))) {
-      return cell;
+  const layout = state.layout;
+  const localX = (point.x - layout.offsetX) / layout.size;
+  const localY = (point.y - layout.offsetY) / layout.size;
+  const approxQ = Math.round(localX / 1.5);
+
+  for (let dq = -2; dq <= 2; dq += 1) {
+    const q = approxQ + dq;
+    const approxR = Math.round((localY / Math.sqrt(3)) - 0.5 * (q & 1));
+    for (let dr = -2; dr <= 2; dr += 1) {
+      const cell = getCell(state.map, q, approxR + dr);
+      if (cell && pointInPoly(point, hexPoints(cell))) {
+        return cell;
+      }
     }
   }
   return null;
@@ -4004,7 +4260,7 @@ function onCanvasWheel(event) {
   state.view.scale = nextScale;
   state.view.offsetX = point.x - baseX * nextScale;
   state.view.offsetY = point.y - baseY * nextScale;
-  render();
+  queueRender();
 }
 
 function onCanvasPointerDown(event) {
@@ -4031,7 +4287,7 @@ function onCanvasPointerMove(event) {
     state.view.lastX = point.x;
     state.view.lastY = point.y;
     state.view.moved = true;
-    render();
+    queueRender();
   }
 }
 
@@ -4068,10 +4324,9 @@ function offsetToPixel(q, r, size) {
 }
 
 function centerOf(cell) {
-  const raw = offsetToPixel(cell.q, cell.r, state.layout.size);
   return {
-    x: raw.x + state.layout.offsetX,
-    y: raw.y + state.layout.offsetY
+    x: cell.rawX * state.layout.size + state.layout.offsetX,
+    y: cell.rawY * state.layout.size + state.layout.offsetY
   };
 }
 
@@ -4233,6 +4488,14 @@ function die(rng, sides) {
 
 function choice(items, rng) {
   return items[Math.floor(rng() * items.length)];
+}
+
+function shuffleInPlace(items, rng) {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
+  return items;
 }
 
 function weightedChoice(items, rng) {
